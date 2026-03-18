@@ -1,5 +1,5 @@
 """
-Oil Refinery Management System
+Saark Industries - ERP
 Single-file version — Python + Tkinter + SQLite
 Run: python oil_refinery.py
 Default Login: admin / admin123
@@ -127,6 +127,78 @@ def apply_theme(name):
     TABLE_SEL_BG = t["TABLE_SEL_BG"]; TABLE_SEL_FG = t["TABLE_SEL_FG"]
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HARDWARE LOCK SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+def _get_machine_id() -> str:
+    """Get unique machine hardware ID — works on Windows/Linux/Mac."""
+    import platform, subprocess, uuid
+    system = platform.system()
+    try:
+        if system == "Windows":
+            # Windows: use CPU ID + Motherboard serial
+            out = subprocess.check_output(
+                "wmic csproduct get uuid", shell=True, stderr=subprocess.DEVNULL
+            ).decode().strip().split("\n")[-1].strip()
+            if out and len(out) > 5:
+                return hashlib.md5(out.encode()).hexdigest()
+        elif system == "Linux":
+            with open("/etc/machine-id") as f:
+                return hashlib.md5(f.read().strip().encode()).hexdigest()
+        elif system == "Darwin":  # Mac
+            out = subprocess.check_output(
+                "ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID",
+                shell=True, stderr=subprocess.DEVNULL
+            ).decode()
+            uid = out.split('"')[-2]
+            return hashlib.md5(uid.encode()).hexdigest()
+    except Exception:
+        pass
+    # Fallback: use MAC address
+    mac = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff)
+                    for ele in range(0, 48, 8)][::-1])
+    return hashlib.md5(mac.encode()).hexdigest()
+
+
+def _get_lock_file() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hwlock")
+
+
+def check_hardware_lock() -> bool:
+    """
+    Returns True if app is allowed to run on this machine.
+    First run: registers this machine automatically.
+    Subsequent runs: checks if machine matches.
+    """
+    lock_file = _get_lock_file()
+    current_id = _get_machine_id()
+
+    if not os.path.exists(lock_file):
+        # First run — register this machine
+        with open(lock_file, "w") as f:
+            f.write(current_id)
+        return True
+
+    with open(lock_file, "r") as f:
+        stored_id = f.read().strip()
+
+    return current_id == stored_id
+
+
+def show_lock_error():
+    """Show unauthorized device error and exit."""
+    root = tk.Tk(); root.withdraw()
+    messagebox.showerror(
+        "Unauthorized Device ❌",
+        "Ye application is computer ke liye authorized nahi hai!\n\n"
+        "This software is licensed for a specific device only.\n"
+        "Please contact the software provider.\n\n"
+        "Error Code: HW-LOCK-001"
+    )
+    root.destroy()
+    import sys; sys.exit(1)
+
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oil_refinery.db")
 
 
@@ -217,12 +289,91 @@ def initialize_database():
         quantity_base REAL NOT NULL,
         entered_quantity REAL NOT NULL,
         entered_unit TEXT NOT NULL)""")
-    c.execute("SELECT COUNT(*) FROM users WHERE username='admin'")
-    if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO users (username,password,role) VALUES (?,?,?)",
-                  ("admin", hash_password("admin123"), "admin"))
+    # Settings table for email backup config
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT '')""")
+    # Default settings
+    for key, val in [
+        ("backup_email",      ""),
+        ("sender_email",      ""),
+        ("sender_password",   ""),
+        ("auto_email_backup", "0"),
+    ]:
+        c.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (key,val))
     conn.commit()
     conn.close()
+
+
+def get_setting(key, default=""):
+    try:
+        conn = get_connection()
+        row  = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row["value"] if row else default
+    except: return default
+
+def set_setting(key, value):
+    try:
+        conn = get_connection()
+        conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key,value))
+        conn.commit(); conn.close()
+    except: pass
+
+def send_email_backup(backup_path):
+    """
+    Backup file email pe bhejo.
+    Returns (True, "") on success or (False, error_msg) on failure.
+    """
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base      import MIMEBase
+    from email.mime.text      import MIMEText
+    from email                import encoders
+
+    sender    = get_setting("sender_email")
+    password  = get_setting("sender_password")
+    recipient = get_setting("backup_email")
+
+    if not sender or not password or not recipient:
+        return False, "Email settings puri nahi hain!\nSettings → Email Backup mein jaake fill karein."
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"]    = sender
+        msg["To"]      = recipient
+        msg["Subject"] = f"Saark Industries — DB Backup {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        body = (f"Saark Industries ERP — Automatic Backup\n\n"
+                f"Date: {datetime.now().strftime('%d %B %Y, %I:%M %p')}\n"
+                f"File: {os.path.basename(backup_path)}\n\n"
+                f"Ye email automatically generate hui hai.\n"
+                f"Backup file attachment mein hai.")
+        msg.attach(MIMEText(body, "plain"))
+
+        # Attach backup file
+        with open(backup_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition",
+                        f"attachment; filename={os.path.basename(backup_path)}")
+        msg.attach(part)
+
+        # Send via Gmail SMTP
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(sender, password)
+            server.sendmail(sender, recipient, msg.as_string())
+
+        return True, ""
+    except smtplib.SMTPAuthenticationError:
+        return False, ("Gmail login fail!\n"
+                       "App Password sahi se daala?\n"
+                       "Guide: myaccount.google.com → Security → App Passwords")
+    except smtplib.SMTPException as e:
+        return False, f"Email send nahi hua: {e}"
+    except Exception as e:
+        return False, f"Error: {e}"
 
 
 def today_str():
@@ -402,12 +553,21 @@ class ModalDialog(tk.Toplevel):
     def __init__(self, parent, title, width=500, height=420):
         super().__init__(parent)
         self.title(title)
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(width, min(height, 400))
         self.configure(bg=BG_CARD)
         self.grab_set()
-        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - width  // 2
-        py = parent.winfo_rooty() + parent.winfo_height() // 2 - height // 2
-        self.geometry(f"{width}x{height}+{px}+{py}")
+        # Screen ke hisaab se size adjust karo
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(width,  sw - 40)
+        h = min(height, sh - 80)
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - w // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - h // 2
+        # Screen ke bahar na jaye
+        px = max(10, min(px, sw - w - 10))
+        py = max(10, min(py, sh - h - 10))
+        self.geometry(f"{w}x{h}+{px}+{py}")
         tk.Frame(self, height=4, bg=ACCENT).pack(fill="x")
         tk.Label(self, text=title, font=FONT_SUBTITLE, bg=BG_CARD,
                  fg=TEXT_MAIN, padx=PAD, pady=PAD).pack(anchor="w")
@@ -417,12 +577,137 @@ class ModalDialog(tk.Toplevel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  FIRST TIME SETUP WINDOW
+# ═══════════════════════════════════════════════════════════════════════════════
+class FirstSetupWindow(tk.Tk):
+    """
+    Pehli baar app khulne pe yahan aao —
+    koi default user nahi hoga, khud account banao.
+    """
+    def __init__(self):
+        super().__init__()
+        self.title("Saark Industries - First Time Setup")
+        self.geometry("460x650")
+        self.resizable(True, True)
+        self.configure(bg=BG_MAIN)
+        self.setup_done = False
+        self._build()
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"460x650+{(sw-460)//2}+{(sh-650)//2}")
+
+    def _build(self):
+        # Banner
+        banner = tk.Frame(self, bg=BG_SIDEBAR, height=160)
+        banner.pack(fill="x"); banner.pack_propagate(False)
+        tk.Label(banner, text="🏭", font=(FONT_FAMILY, 42),
+                 bg=BG_SIDEBAR, fg=ACCENT).pack(pady=(20,4))
+        tk.Label(banner, text="Saark Industries",
+                 font=(FONT_FAMILY, 16, "bold"),
+                 bg=BG_SIDEBAR, fg=TEXT_LIGHT).pack()
+        tk.Label(banner, text="Pehli Baar Setup",
+                 font=FONT_NORMAL, bg=BG_SIDEBAR, fg=TEXT_SIDEBAR).pack()
+
+        card = tk.Frame(self, bg=BG_CARD, padx=32, pady=20)
+        card.pack(fill="both", expand=True, padx=24, pady=20)
+
+        # Welcome message
+        tk.Label(card, text="👋 Welcome!",
+                 font=FONT_SUBTITLE, bg=BG_CARD, fg=TEXT_MAIN).pack(anchor="w")
+        tk.Label(card,
+                 text="Apna Admin account banao.\n"
+                      "Ye account sirf aapka hoga — koi default password nahi!",
+                 font=FONT_SMALL, bg=BG_CARD, fg=TEXT_MUTED,
+                 justify="left").pack(anchor="w", pady=(4, 16))
+
+        tk.Frame(card, height=1, bg=BORDER).pack(fill="x", pady=(0,16))
+
+        # Username
+        tk.Label(card, text="Username *", font=FONT_SMALL,
+                 bg=BG_CARD, fg=TEXT_MUTED).pack(anchor="w")
+        self.user_var = tk.StringVar()
+        tk.Entry(card, textvariable=self.user_var, font=FONT_NORMAL,
+                 bg=ENTRY_BG, fg=ENTRY_FG, relief="solid", bd=1
+                 ).pack(fill="x", ipady=6, pady=(2, 12))
+
+        # Password
+        tk.Label(card, text="Password *", font=FONT_SMALL,
+                 bg=BG_CARD, fg=TEXT_MUTED).pack(anchor="w")
+        self.pass_var = tk.StringVar()
+        tk.Entry(card, textvariable=self.pass_var, show="•",
+                 font=FONT_NORMAL, bg=ENTRY_BG, fg=ENTRY_FG,
+                 relief="solid", bd=1
+                 ).pack(fill="x", ipady=6, pady=(2, 12))
+
+        # Confirm Password
+        tk.Label(card, text="Confirm Password *", font=FONT_SMALL,
+                 bg=BG_CARD, fg=TEXT_MUTED).pack(anchor="w")
+        self.conf_var = tk.StringVar()
+        conf_e = tk.Entry(card, textvariable=self.conf_var, show="•",
+                          font=FONT_NORMAL, bg=ENTRY_BG, fg=ENTRY_FG,
+                          relief="solid", bd=1)
+        conf_e.pack(fill="x", ipady=6, pady=(2, 16))
+        conf_e.bind("<Return>", lambda e: self._create())
+
+        # Info box
+        info = tk.Frame(card, bg="#EBF5FB", padx=10, pady=8)
+        info.pack(fill="x", pady=(0, 16))
+        tk.Label(info,
+                 text="💡 Ye username/password yaad rakhein!\n"
+                      "Baad mein aur users bhi add kar sakte hain.",
+                 font=FONT_SMALL, bg="#EBF5FB", fg=INFO,
+                 justify="left").pack(anchor="w")
+
+        # Create button
+        btn = tk.Button(card, text="✅ Admin Account Banao",
+                        command=self._create,
+                        bg=ACCENT, fg=TEXT_LIGHT, font=FONT_BOLD,
+                        relief="flat", bd=0, cursor="hand2", pady=10)
+        btn.pack(fill="x")
+        btn.bind("<Enter>", lambda e: btn.config(bg=ACCENT_DARK))
+        btn.bind("<Leave>", lambda e: btn.config(bg=ACCENT))
+
+    def _create(self):
+        uname = self.user_var.get().strip()
+        pwd   = self.pass_var.get().strip()
+        conf  = self.conf_var.get().strip()
+
+        if not uname:
+            messagebox.showerror("Error", "Username zaroori hai!", parent=self); return
+        if len(uname) < 3:
+            messagebox.showerror("Error", "Username kam se kam 3 characters ka hona chahiye!", parent=self); return
+        if not pwd:
+            messagebox.showerror("Error", "Password zaroori hai!", parent=self); return
+        if len(pwd) < 6:
+            messagebox.showerror("Error", "Password kam se kam 6 characters ka hona chahiye!", parent=self); return
+        if pwd != conf:
+            messagebox.showerror("Error", "Dono passwords match nahi karte!", parent=self); return
+
+        try:
+            conn = get_connection()
+            conn.execute(
+                "INSERT INTO users (username, password, role) VALUES (?,?,?)",
+                (uname, hash_password(pwd), "admin")
+            )
+            conn.commit(); conn.close()
+            messagebox.showinfo("Success! ✅",
+                                f"Admin account ban gaya!\n\n"
+                                f"Username: {uname}\n\n"
+                                f"Ab login karein.",
+                                parent=self)
+            self.setup_done = True
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  LOGIN WINDOW
 # ═══════════════════════════════════════════════════════════════════════════════
 class LoginWindow(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Oil Refinery – Login")
+        self.title("Saark Industries - Login")
         self.geometry("420x520")
         self.resizable(False, False)
         self.configure(bg=BG_MAIN)
@@ -436,7 +721,7 @@ class LoginWindow(tk.Tk):
         banner = tk.Frame(self, bg=BG_SIDEBAR, height=180)
         banner.pack(fill="x"); banner.pack_propagate(False)
         tk.Label(banner, text="⚙", font=(FONT_FAMILY, 48), bg=BG_SIDEBAR, fg=ACCENT).pack(pady=(30,4))
-        tk.Label(banner, text="Oil Refinery", font=(FONT_FAMILY,16,"bold"), bg=BG_SIDEBAR, fg=TEXT_LIGHT).pack()
+        tk.Label(banner, text="Saark Industries", font=(FONT_FAMILY,16,"bold"), bg=BG_SIDEBAR, fg=TEXT_LIGHT).pack()
         tk.Label(banner, text="Management System", font=FONT_NORMAL, bg=BG_SIDEBAR, fg=TEXT_SIDEBAR).pack()
 
         card = tk.Frame(self, bg=BG_CARD, padx=32, pady=24)
@@ -444,7 +729,7 @@ class LoginWindow(tk.Tk):
         tk.Label(card, text="Sign In", font=FONT_SUBTITLE, bg=BG_CARD, fg=TEXT_MAIN).pack(anchor="w", pady=(0,16))
 
         tk.Label(card, text="Username", font=FONT_SMALL, bg=BG_CARD, fg=TEXT_MUTED).pack(anchor="w")
-        self.user_var = tk.StringVar(value="admin")
+        self.user_var = tk.StringVar()
         tk.Entry(card, textvariable=self.user_var, font=FONT_NORMAL, bg=ENTRY_BG, fg=ENTRY_FG,
                  relief="solid", bd=1).pack(fill="x", ipady=6, pady=(2,12))
 
@@ -460,8 +745,6 @@ class LoginWindow(tk.Tk):
         btn.pack(fill="x")
         btn.bind("<Enter>", lambda e: btn.config(bg=ACCENT_DARK))
         btn.bind("<Leave>", lambda e: btn.config(bg=ACCENT))
-        tk.Label(card, text="Default: admin / admin123", font=FONT_SMALL,
-                 bg=BG_CARD, fg=TEXT_MUTED).pack(pady=(12,0))
 
     def _login(self):
         u = self.user_var.get().strip()
@@ -624,6 +907,7 @@ class ProductsFrame(tk.Frame):
         SectionHeader(self, "Products Management").pack(fill="x")
         bar = tk.Frame(self, bg=BG_MAIN, pady=PAD_SMALL, padx=PAD); bar.pack(fill="x")
         StyledButton(bar, "+ Add Product", command=self._add).pack(side="left")
+        if PDF_OK: StyledButton(bar, "📄 PDF", command=self._pdf, kind="danger").pack(side="left", padx=8)
         self.table = StyledTable(self, [("id","ID",50),("name","Product Name",200),
             ("bu","Base Unit",100),("tu","Trade Unit",100),("cf","Conv.Factor",100),
             ("stock","Stock",120),("act","Active",60)])
@@ -657,6 +941,41 @@ class ProductsFrame(tk.Frame):
         conn = get_connection()
         conn.execute("UPDATE products SET is_active=0 WHERE id=?", (sel[0],))
         conn.commit(); conn.close(); self.load_data()
+
+    def _pdf(self):
+        if not PDF_OK: messagebox.showinfo("PDF","pip install reportlab"); return
+        rows = self.table._all_rows
+        if not rows: messagebox.showinfo("PDF","Koi product nahi hai."); return
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
+        c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
+        c.setFillColor("#1A2332"); c.rect(0, h-70, w, 70, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, h-38, "Saark Industries — Products List")
+        c.setFont("Helvetica", 9)
+        c.drawString(40, h-56, f"Total Products: {len(rows)}   |   Generated: {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+        y = h - 90
+        col_x = [40, 80, 230, 300, 360, 420, 490, 545]
+        hdrs  = ["ID","Product Name","Base Unit","Trade Unit","Conv.Factor","Stock","Active"]
+        c.setFillColor("#2C3E50"); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 8)
+        for i, hdr in enumerate(hdrs):
+            if i < len(col_x): c.drawString(col_x[i], y+2, hdr)
+        y -= 18
+        c.setFont("Helvetica", 8)
+        for ri, row in enumerate(rows):
+            if y < 60: c.showPage(); y = h-60; c.setFont("Helvetica", 8)
+            bg = "#F7F9FC" if ri%2==0 else "white"
+            c.setFillColor(bg); c.rect(38, y-2, w-76, 16, fill=1, stroke=0)
+            c.setFillColor("#2C3E50")
+            vals = [str(row[0]), str(row[1])[:20], str(row[2]), str(row[3]),
+                    str(row[4]), str(row[5]), str(row[6])]
+            for i, val in enumerate(vals):
+                if i < len(col_x): c.drawString(col_x[i], y+1, val[:18])
+            y -= 16
+        c.save()
+        messagebox.showinfo("PDF", f"PDF saved!\n{path}")
 
 
 class ProductDialog(ModalDialog):
@@ -720,6 +1039,7 @@ class PartiesFrame(tk.Frame):
         SectionHeader(self, "Parties Management").pack(fill="x")
         bar = tk.Frame(self, bg=BG_MAIN, pady=PAD_SMALL, padx=PAD); bar.pack(fill="x")
         StyledButton(bar, "+ Add Party", command=self._add).pack(side="left")
+        if PDF_OK: StyledButton(bar, "📄 PDF", command=self._pdf, kind="danger").pack(side="left", padx=8)
         self.table = StyledTable(self, [("id","ID",50),("name","Party Name",250),
                                          ("addr","Address",300),("act","Active",60)])
         # Search bar
@@ -751,6 +1071,40 @@ class PartiesFrame(tk.Frame):
         conn = get_connection()
         conn.execute("UPDATE parties SET is_active=0 WHERE id=?", (sel[0],))
         conn.commit(); conn.close(); self.load_data()
+
+    def _pdf(self):
+        if not PDF_OK: messagebox.showinfo("PDF","pip install reportlab"); return
+        rows = self.table._all_rows
+        if not rows: messagebox.showinfo("PDF","Koi party nahi hai."); return
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
+        c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
+        c.setFillColor("#1A2332"); c.rect(0, h-70, w, 70, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, h-38, "Saark Industries — Parties List")
+        c.setFont("Helvetica", 9)
+        c.drawString(40, h-56, f"Total Parties: {len(rows)}   |   Generated: {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+        y = h - 90
+        col_x = [40, 80, 290, 510]
+        hdrs  = ["ID", "Party Name", "Address", "Active"]
+        c.setFillColor("#2C3E50"); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 9)
+        for i, hdr in enumerate(hdrs):
+            c.drawString(col_x[i], y+2, hdr)
+        y -= 18
+        c.setFont("Helvetica", 9)
+        for ri, row in enumerate(rows):
+            if y < 60: c.showPage(); y = h-60; c.setFont("Helvetica", 9)
+            bg = "#F7F9FC" if ri%2==0 else "white"
+            c.setFillColor(bg); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+            c.setFillColor("#2C3E50")
+            vals = [str(row[0]), str(row[1])[:28], str(row[2])[:30], str(row[3])]
+            for i, val in enumerate(vals):
+                c.drawString(col_x[i], y+2, val)
+            y -= 18
+        c.save()
+        messagebox.showinfo("PDF", f"PDF saved!\n{path}")
 
 
 class PartyDialog(ModalDialog):
@@ -798,6 +1152,7 @@ class TransactionsFrame(tk.Frame):
         bar = tk.Frame(self, bg=BG_MAIN, pady=PAD_SMALL, padx=PAD); bar.pack(fill="x")
         StyledButton(bar, "+ New Transaction", command=self._add).pack(side="left")
         if EXCEL_OK: StyledButton(bar, "⬆ Export Excel", command=self._export, kind="info").pack(side="left", padx=8)
+        if PDF_OK:   StyledButton(bar, "📄 PDF",          command=self._pdf,    kind="danger").pack(side="left")
 
         filt = tk.Frame(self, bg=BG_MAIN, padx=PAD, pady=4); filt.pack(fill="x")
         tk.Label(filt, text="From:", font=FONT_SMALL, bg=BG_MAIN, fg=TEXT_MUTED).pack(side="left")
@@ -885,6 +1240,55 @@ class TransactionsFrame(tk.Frame):
         ws.append(["ID","Date","Type","Party","Product","Qty","Unit","Rate","GST","Total","Pay Cash","Pay Online","Balance","Remarks"])
         for r in rows: ws.append(list(r))
         wb.save(path); messagebox.showinfo("Export", f"Saved: {path}")
+
+    def _pdf(self):
+        if not PDF_OK: messagebox.showinfo("PDF","pip install reportlab"); return
+        rows = self.table._all_rows
+        if not rows: messagebox.showinfo("PDF","Koi data nahi hai."); return
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
+        c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
+        # Header
+        c.setFillColor("#1A2332"); c.rect(0, h-70, w, 70, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, h-38, "Saark Industries — Transactions")
+        c.setFont("Helvetica", 9)
+        c.drawString(40, h-56, f"Period: {self.from_var.get()} to {self.to_var.get()}   |   Total: {len(rows)} records   |   Generated: {datetime.now().strftime('%d %b %Y')}")
+        y = h - 90
+        # Table headers
+        col_x = [40, 80, 145, 215, 300, 355, 385, 415, 445, 480, 520, 560]
+        hdrs  = ["ID","Date","Type","Party","Product","Qty","Rate","GST","Total","PayCash","PayOnl","Balance"]
+        c.setFillColor("#2C3E50"); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 7)
+        for i, hdr in enumerate(hdrs):
+            if i < len(col_x): c.drawString(col_x[i], y+2, hdr)
+        y -= 18
+        c.setFont("Helvetica", 7)
+        total_amt = 0.0
+        for ri, row in enumerate(rows):
+            if y < 60: c.showPage(); y = h-60; c.setFont("Helvetica", 7)
+            bg = "#F7F9FC" if ri%2==0 else "white"
+            c.setFillColor(bg); c.rect(38, y-2, w-76, 15, fill=1, stroke=0)
+            # Color type
+            typ = str(row[2]) if len(row) > 2 else ""
+            c.setFillColor("#27AE60" if typ=="SALE" else "#2980B9" if typ=="PURCHASE" else "#2C3E50")
+            vals = [str(row[0]),str(row[1]),typ,
+                    str(row[3])[:12],str(row[4])[:12],
+                    str(row[5]),str(row[7]),str(row[8]),
+                    str(row[9]),str(row[10]),str(row[11]),str(row[12])]
+            for i, val in enumerate(vals):
+                if i < len(col_x): c.drawString(col_x[i], y+1, val[:12])
+            try: total_amt += float(str(row[9]).replace(",",""))
+            except: pass
+            y -= 15
+        # Footer
+        y -= 5
+        c.setFillColor("#1A2332"); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 9)
+        c.drawString(42, y+2, f"Total Records: {len(rows)}   |   Total Amount: Rs{total_amt:,.2f}")
+        c.save()
+        messagebox.showinfo("PDF", f"PDF saved!\n{path}")
 
 
 class TransactionDialog(ModalDialog):
@@ -1338,6 +1742,7 @@ class PartyLedgerFrame(tk.Frame):
         make_date_entry(filt, self.to_var).grid(row=0,column=7,padx=4)
         StyledButton(filt,"📊 Generate",command=self._generate,kind="info").grid(row=0,column=8,padx=(12,0))
         if EXCEL_OK: StyledButton(filt,"⬆ Excel",command=self._export,kind="neutral").grid(row=0,column=9,padx=4)
+        if PDF_OK:   StyledButton(filt,"📄 PDF",  command=self._pdf,   kind="danger" ).grid(row=0,column=10,padx=4)
 
         self.outstanding_lbl = tk.Label(self, text="Outstanding: ₹0.00", font=FONT_SUBTITLE, bg=BG_MAIN, fg=ACCENT)
         self.outstanding_lbl.pack(anchor="e", padx=PAD)
@@ -1404,6 +1809,50 @@ class PartyLedgerFrame(tk.Frame):
         for r in self._rows_cache: ws.append(list(r))
         wb.save(path); messagebox.showinfo("Export", f"Saved: {path}")
 
+    def _pdf(self):
+        if not PDF_OK: messagebox.showinfo("PDF","pip install reportlab"); return
+        if not self._rows_cache: messagebox.showinfo("PDF","Pehle Generate karein."); return
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
+        c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
+        # Header
+        c.setFillColor("#1A2332"); c.rect(0, h-70, w, 70, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, h-38, "Saark Industries — Party Ledger")
+        c.setFont("Helvetica", 9)
+        party_txt = self.party_var.get()
+        c.drawString(40, h-56, f"Party: {party_txt}   |   Period: {self.from_var.get()} to {self.to_var.get()}   |   Generated: {datetime.now().strftime('%d %b %Y')}")
+        # Outstanding
+        outstanding_txt = self.outstanding_lbl.cget("text")
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(w-200, h-56, outstanding_txt)
+        y = h - 90
+        # Table headers
+        col_x = [40, 100, 170, 285, 330, 375, 430, 480, 520, 565]
+        hdrs  = ["Date","Type","Product","Qty","Rate","Debit","Credit","PayCash","PayOnl","Balance"]
+        c.setFillColor("#2C3E50"); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 7)
+        for i, hdr in enumerate(hdrs):
+            if i < len(col_x): c.drawString(col_x[i], y+2, hdr)
+        y -= 18
+        c.setFont("Helvetica", 7)
+        for ri, row in enumerate(self._rows_cache):
+            if y < 60: c.showPage(); y = h-60; c.setFont("Helvetica", 7)
+            bg = "#F7F9FC" if ri%2==0 else "white"
+            c.setFillColor(bg); c.rect(38, y-2, w-76, 15, fill=1, stroke=0)
+            c.setFillColor("#2C3E50")
+            for i, val in enumerate(row):
+                if i < len(col_x): c.drawString(col_x[i], y+1, str(val)[:14])
+            y -= 15
+        # Footer outstanding
+        y -= 5
+        c.setFillColor("#1A2332"); c.rect(38, y-2, w-76, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 9)
+        c.drawString(42, y+2, outstanding_txt)
+        c.save()
+        messagebox.showinfo("PDF", f"PDF saved!\n{path}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PROFIT / LOSS
@@ -1423,7 +1872,8 @@ class ProfitLossFrame(tk.Frame):
         self.to_var = tk.StringVar(value=today_str())
         make_date_entry(filt, self.to_var).pack(side="left", padx=4)
         StyledButton(filt,"📊 Generate",command=self._generate,kind="info").pack(side="left", padx=8)
-        if EXCEL_OK: StyledButton(filt,"⬆ Excel",command=self._export,kind="neutral").pack(side="left")
+        if EXCEL_OK: StyledButton(filt,"⬆ Excel",command=self._export,kind="neutral").pack(side="left", padx=(0,6))
+        if PDF_OK:   StyledButton(filt,"📄 PDF",  command=self._pdf,   kind="danger" ).pack(side="left")
 
         cards = tk.Frame(self, bg=BG_MAIN, padx=PAD, pady=PAD); cards.pack(fill="x")
         self._cards = {}
@@ -1516,6 +1966,113 @@ class ProfitLossFrame(tk.Frame):
             ws.append([k,v])
         wb.save(path); messagebox.showinfo("Export", f"Saved: {path}")
 
+    def _pdf(self):
+        if not PDF_OK: messagebox.showinfo("PDF","pip install reportlab"); return
+        if not self._data: messagebox.showinfo("PDF","Pehle Generate karein."); return
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
+        c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
+        # Header
+        c.setFillColor("#2ECC71"); c.rect(0, h-70, w, 70, fill=1, stroke=0)
+        c.setFillColor("white")
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(40, h-40, "Saark Industries — Profit / Loss Report")
+        c.setFont("Helvetica", 10)
+        fd = self.from_var.get(); td = self.to_var.get()
+        c.drawString(40, h-58, f"Period: {fd}  to  {td}   |   Generated: {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+        # Summary Cards
+        y = h - 110
+        c.setFillColor("black"); c.setFont("Helvetica-Bold", 12)
+        c.drawString(40, y, "SUMMARY")
+        y -= 20
+        items = [
+            ("Total Sales",     self._data["sales"],     "#2ECC71"),
+            ("Total Purchases", self._data["purchases"], "#2980B9"),
+            ("Total Expenses",  self._data["expenses"],  "#F39C12"),
+            ("Net Profit/Loss", self._data["net"],
+             "#27AE60" if self._data["net"] >= 0 else "#E74C3C"),
+        ]
+        box_w = (w - 80) / 4
+        for i, (title, val, color) in enumerate(items):
+            x = 40 + i * box_w
+            # Box
+            c.setFillColor(color)
+            c.roundRect(x, y-50, box_w-10, 55, 5, fill=1, stroke=0)
+            c.setFillColor("white")
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(x+8, y-15, title)
+            c.setFont("Helvetica-Bold", 13)
+            c.drawString(x+8, y-38, f"Rs{val:,.2f}")
+        y -= 80
+        # Detail tables
+        def draw_table(title, color, rows, headers):
+            nonlocal y
+            if not rows: return
+            if y < 120: c.showPage(); y = h - 60
+            c.setFillColor(color); c.rect(40, y-2, w-80, 20, fill=1, stroke=0)
+            c.setFillColor("white"); c.setFont("Helvetica-Bold", 11)
+            c.drawString(44, y+3, title)
+            y -= 22
+            # Headers
+            c.setFillColor("#2C3E50"); c.rect(40, y-2, w-80, 18, fill=1, stroke=0)
+            c.setFillColor("white"); c.setFont("Helvetica-Bold", 8)
+            col_x = [44, 120, 220, 330, 390, 440, 490]
+            for j, hdr in enumerate(headers):
+                if j < len(col_x): c.drawString(col_x[j], y+2, hdr)
+            y -= 18
+            c.setFont("Helvetica", 8)
+            for ri, row in enumerate(rows):
+                if y < 60: c.showPage(); y = h-60; c.setFont("Helvetica", 8)
+                bg = "#F7F9FC" if ri%2==0 else "white"
+                c.setFillColor(bg); c.rect(40, y-2, w-80, 16, fill=1, stroke=0)
+                c.setFillColor("#2C3E50")
+                for j, val in enumerate(row):
+                    if j < len(col_x): c.drawString(col_x[j], y+1, str(val)[:18])
+                y -= 16
+            y -= 10
+
+        # Get detail data
+        conn = get_connection()
+        sales_rows = conn.execute("""
+            SELECT t.date,p.name,pr.name,t.entered_quantity,
+                   t.price_per_unit,t.gst,t.total_amount
+            FROM transactions t
+            JOIN parties p ON p.id=t.party_id
+            JOIN products pr ON pr.id=t.product_id
+            WHERE t.type='SALE' AND t.date BETWEEN ? AND ?
+            ORDER BY t.date""", (fd,td)).fetchall()
+        purch_rows = conn.execute("""
+            SELECT t.date,p.name,pr.name,t.entered_quantity,
+                   t.price_per_unit,t.gst,t.total_amount
+            FROM transactions t
+            JOIN parties p ON p.id=t.party_id
+            JOIN products pr ON pr.id=t.product_id
+            WHERE t.type='PURCHASE' AND t.date BETWEEN ? AND ?
+            ORDER BY t.date""", (fd,td)).fetchall()
+        exp_rows = conn.execute("""
+            SELECT e.date,COALESCE(emp.name,'-'),e.category,
+                   e.description,e.amount
+            FROM expenses e
+            LEFT JOIN employees emp ON emp.id=e.employee_id
+            WHERE e.date BETWEEN ? AND ?
+            ORDER BY e.date""", (fd,td)).fetchall()
+        conn.close()
+
+        hdrs = ["Date","Party","Product","Qty","Rate","GST","Total"]
+        draw_table("SALES", "#2ECC71",
+                   [(r[0],r[1][:15],r[2][:15],f"{r[3]:.1f}",
+                     f"{r[4]:.2f}",f"{r[5]:.2f}",f"Rs{r[6]:.2f}") for r in sales_rows], hdrs)
+        draw_table("PURCHASES", "#2980B9",
+                   [(r[0],r[1][:15],r[2][:15],f"{r[3]:.1f}",
+                     f"{r[4]:.2f}",f"{r[5]:.2f}",f"Rs{r[6]:.2f}") for r in purch_rows], hdrs)
+        draw_table("EXPENSES", "#F39C12",
+                   [(r[0],r[1][:15],r[2][:12],r[3][:15] if r[3] else "-",
+                     f"Rs{r[4]:.2f}","","") for r in exp_rows],
+                   ["Date","Employee","Category","Description","Amount","",""])
+        c.save()
+        messagebox.showinfo("PDF", f"PDF saved!\n{path}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PRODUCTION LEDGER
@@ -1542,7 +2099,8 @@ class ProductionLedgerFrame(tk.Frame):
         ttk.Combobox(filt,textvariable=self.prod_var,values=["All"]+[p["name"] for p in self._products],
                      state="readonly",width=20,font=FONT_NORMAL).pack(side="left", padx=4)
         StyledButton(filt,"📊 Generate",command=self._generate,kind="info").pack(side="left", padx=8)
-        if EXCEL_OK: StyledButton(filt,"⬆ Excel",command=self._export,kind="neutral").pack(side="left")
+        if EXCEL_OK: StyledButton(filt,"⬆ Excel",command=self._export,kind="neutral").pack(side="left", padx=(0,6))
+        if PDF_OK:   StyledButton(filt,"📄 PDF",  command=self._pdf,   kind="danger" ).pack(side="left")
 
         self.table = StyledTable(self, [("batch","Batch",70),("date","Date",90),("prod","Product",160),
             ("inp","Input Qty",100),("out","Output Qty",100),("loss","Loss %",80),("bal","Balance",100)])
@@ -1589,6 +2147,44 @@ class ProductionLedgerFrame(tk.Frame):
         ws.append(["Batch","Date","Product","Input","Output","Loss%","Balance"])
         for r in self._rows_cache: ws.append(list(r))
         wb.save(path); messagebox.showinfo("Export", f"Saved: {path}")
+
+    def _pdf(self):
+        if not PDF_OK: messagebox.showinfo("PDF","pip install reportlab"); return
+        if not self._rows_cache: messagebox.showinfo("PDF","Pehle Generate karein."); return
+        from tkinter.filedialog import asksaveasfilename
+        path = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
+        c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
+        # Header
+        c.setFillColor("#1A2332"); c.rect(0, h-70, w, 70, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, h-38, "Saark Industries — Production Ledger")
+        c.setFont("Helvetica", 9)
+        c.drawString(40, h-56, f"Period: {self.from_var.get()} to {self.to_var.get()}   |   Generated: {datetime.now().strftime('%d %b %Y %I:%M %p')}")
+        y = h - 90
+        # Table headers
+        c.setFillColor("#2C3E50"); c.rect(40, y-2, w-80, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 9)
+        col_x = [44, 90, 150, 290, 370, 450, 500]
+        for i, hdr in enumerate(["Batch","Date","Product","Input Qty","Output Qty","Loss%","Balance"]):
+            c.drawString(col_x[i], y+2, hdr)
+        y -= 18
+        c.setFont("Helvetica", 8)
+        for ri, row in enumerate(self._rows_cache):
+            if y < 60: c.showPage(); y = h-60; c.setFont("Helvetica", 8)
+            bg = "#F7F9FC" if ri%2==0 else "white"
+            c.setFillColor(bg); c.rect(40, y-2, w-80, 16, fill=1, stroke=0)
+            c.setFillColor("#2C3E50")
+            for i, val in enumerate(row):
+                if i < len(col_x): c.drawString(col_x[i], y+1, str(val)[:20])
+            y -= 16
+        # Total rows
+        y -= 5
+        c.setFillColor("#1A2332"); c.rect(40, y-2, w-80, 18, fill=1, stroke=0)
+        c.setFillColor("white"); c.setFont("Helvetica-Bold", 9)
+        c.drawString(44, y+2, f"Total Batches: {len(set(r[0] for r in self._rows_cache))}   |   Total Records: {len(self._rows_cache)}")
+        c.save()
+        messagebox.showinfo("PDF", f"PDF saved!\n{path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1653,14 +2249,48 @@ class ExpenseFrame(tk.Frame):
         if EXCEL_OK: StyledButton(btn_row,"⬆ Excel",command=self._export,kind="info").pack(side="left",padx=(0,8))
         if PDF_OK:   StyledButton(btn_row,"📄 PDF",command=self._pdf,kind="neutral").pack(side="left")
 
+        # Filter row - Category + Employee + Month
         filt = tk.Frame(self, bg=BG_MAIN, padx=PAD, pady=4); filt.pack(fill="x")
+
         tk.Label(filt,text="From:",font=FONT_SMALL,bg=BG_MAIN,fg=TEXT_MUTED).pack(side="left")
         self.f_from = tk.StringVar(value="2020-01-01")
         make_date_entry(filt, self.f_from).pack(side="left", padx=4)
         tk.Label(filt,text="To:",font=FONT_SMALL,bg=BG_MAIN,fg=TEXT_MUTED).pack(side="left", padx=(8,0))
         self.f_to = tk.StringVar(value=today_str())
         make_date_entry(filt, self.f_to).pack(side="left", padx=4)
+
+        # Category filter
+        tk.Label(filt,text="Category:",font=FONT_SMALL,bg=BG_MAIN,fg=TEXT_MUTED).pack(side="left", padx=(12,4))
+        self.f_cat = tk.StringVar(value="All")
+        ttk.Combobox(filt,textvariable=self.f_cat,
+                     values=["All"]+CATEGORIES,
+                     state="readonly",width=14,font=FONT_NORMAL).pack(side="left", padx=4)
+
+        # Employee filter
+        tk.Label(filt,text="Employee:",font=FONT_SMALL,bg=BG_MAIN,fg=TEXT_MUTED).pack(side="left", padx=(8,4))
+        self.f_emp = tk.StringVar(value="All")
+        self.f_emp_cb = ttk.Combobox(filt,textvariable=self.f_emp,
+                                      values=["All"]+[e["name"] for e in self._employees],
+                                      state="readonly",width=16,font=FONT_NORMAL)
+        self.f_emp_cb.pack(side="left", padx=4)
+
         StyledButton(filt,"🔍 Filter",command=self.load_data,kind="info").pack(side="left", padx=8)
+        StyledButton(filt,"↺ Reset",command=self._reset_filter,kind="neutral").pack(side="left")
+
+        # Description filter - alag row mein
+        filt2 = tk.Frame(self, bg=BG_MAIN, padx=PAD, pady=2); filt2.pack(fill="x")
+        tk.Label(filt2,text="Description:",font=FONT_SMALL,bg=BG_MAIN,fg=TEXT_MUTED).pack(side="left")
+        self.f_desc = tk.StringVar()
+        self.f_desc.trace_add("write", lambda *_: self.load_data())
+        desc_entry = tk.Entry(filt2, textvariable=self.f_desc, font=FONT_NORMAL,
+                              bg=ENTRY_BG, fg=ENTRY_FG, relief="solid", bd=1, width=40)
+        desc_entry.pack(side="left", padx=6, ipady=4)
+        # Clear button
+        tk.Button(filt2, text="✕", font=FONT_SMALL, bg=ENTRY_BG, fg=TEXT_MUTED,
+                  relief="flat", bd=0, cursor="hand2",
+                  command=lambda: self.f_desc.set("")).pack(side="left")
+        tk.Label(filt2, text="← type karo, apne aap filter ho jayega",
+                 font=FONT_SMALL, bg=BG_MAIN, fg=TEXT_MUTED).pack(side="left", padx=8)
 
         self.table = StyledTable(self, [("id","ID",40),("date","Date",90),("cat","Category",110),
             ("emp","Employee",140),("desc","Description",200),("amt","Amount",100)])
@@ -1679,18 +2309,62 @@ class ExpenseFrame(tk.Frame):
             self.desc_var.set(f"Salary of {self.emp_var.get()}")
     def _add_emp(self): AddEmployeeDialog(self, on_save=self._refresh_emp)
     def _refresh_emp(self):
-        self._load_employees(); self.emp_cb["values"] = [e["name"] for e in self._employees]
+        self._load_employees()
+        self.emp_cb["values"] = [e["name"] for e in self._employees]
+        self.f_emp_cb["values"] = ["All"] + [e["name"] for e in self._employees]
+
+    def _reset_filter(self):
+        self.f_from.set("2020-01-01")
+        self.f_to.set(today_str())
+        self.f_cat.set("All")
+        self.f_emp.set("All")
+        self.f_desc.set("")
+        self.load_data()
 
     def load_data(self):
         conn = get_connection()
-        rows = conn.execute("""
-            SELECT e.id,e.date,e.category,COALESCE(emp.name,'') as en,e.description,e.amount
-            FROM expenses e LEFT JOIN employees emp ON emp.id=e.employee_id
-            WHERE e.date BETWEEN ? AND ? ORDER BY e.date DESC""", (self.f_from.get(),self.f_to.get())).fetchall()
+        # Build query with filters
+        filters = ["e.date BETWEEN ? AND ?"]
+        params  = [self.f_from.get(), self.f_to.get()]
+
+        if self.f_cat.get() != "All":
+            filters.append("e.category=?")
+            params.append(self.f_cat.get())
+
+        if self.f_emp.get() != "All":
+            emp = next((e for e in self._employees if e["name"] == self.f_emp.get()), None)
+            if emp:
+                filters.append("e.employee_id=?")
+                params.append(emp["id"])
+
+        # Description filter
+        desc_kw = self.f_desc.get().strip()
+        if desc_kw:
+            filters.append("LOWER(COALESCE(e.description,'')) LIKE ?")
+            params.append(f"%{desc_kw.lower()}%")
+
+        where = " AND ".join(filters)
+        rows = conn.execute(f"""
+            SELECT e.id, e.date, e.category,
+                   COALESCE(emp.name,'') as en,
+                   e.description, e.amount
+            FROM expenses e
+            LEFT JOIN employees emp ON emp.id=e.employee_id
+            WHERE {where}
+            ORDER BY e.date DESC""", params).fetchall()
         conn.close()
         total = sum(r["amount"] for r in rows)
-        self.table.load([(r["id"],r["date"],r["category"],r["en"],r["description"] or "",f"{r['amount']:.2f}") for r in rows])
-        self.total_lbl.config(text=f"Total: ₹{total:,.2f}")
+        self.table.load([(r["id"],r["date"],r["category"],r["en"],
+                          r["description"] or "",f"{r['amount']:.2f}") for r in rows])
+        # Show filtered total
+        cat_txt  = self.f_cat.get()
+        emp_txt  = self.f_emp.get()
+        desc_txt = self.f_desc.get().strip()
+        label    = "Total"
+        if cat_txt  != "All": label += f" ({cat_txt})"
+        if emp_txt  != "All": label += f" [{emp_txt}]"
+        if desc_txt:          label += f" | '{desc_txt}'"
+        self.total_lbl.config(text=f"{label}: ₹{total:,.2f}")
 
     def _save(self):
         date=self.date_var.get(); cat=self.cat_var.get(); desc=self.desc_var.get().strip() or None
@@ -1737,7 +2411,7 @@ class ExpenseFrame(tk.Frame):
         rows = conn.execute("SELECT e.date,e.category,COALESCE(emp.name,'') as emp,e.description,e.amount FROM expenses e LEFT JOIN employees emp ON emp.id=e.employee_id ORDER BY e.date DESC").fetchall()
         conn.close()
         c = rl_canvas.Canvas(path, pagesize=A4); w, h = A4
-        c.setFont("Helvetica-Bold",16); c.drawString(50,h-60,"Oil Refinery – Expense Report")
+        c.setFont("Helvetica-Bold",16); c.drawString(50,h-60,"Saark Industries – Expense Report")
         c.setFont("Helvetica",10); c.drawString(50,h-80,f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         y = h-110; col_x=[50,130,220,310,460]
         c.setFont("Helvetica-Bold",10)
@@ -1780,13 +2454,333 @@ class AddEmployeeDialog(ModalDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  USERS MANAGEMENT (sirf admin ke liye)
+# ═══════════════════════════════════════════════════════════════════════════════
+class UsersFrame(tk.Frame):
+    def __init__(self, parent, current_user=None):
+        super().__init__(parent, bg=BG_MAIN)
+        self._current_user = current_user or {}
+        self._build(); self.load_data()
+
+    def _build(self):
+        SectionHeader(self, "👥 Users Management").pack(fill="x")
+
+        # Warning banner
+        warn = tk.Frame(self, bg="#FEF9E7", padx=PAD, pady=8,
+                        highlightthickness=1, highlightbackground=WARNING)
+        warn.pack(fill="x", padx=PAD, pady=(0, PAD_SMALL))
+        tk.Label(warn, text="⚠  Sirf Admin log yahan access kar sakte hain!  "
+                            "Apna Developer account kabhi delete mat karna.",
+                 font=FONT_SMALL, bg="#FEF9E7", fg=WARNING_DARK).pack(side="left")
+
+        bar = tk.Frame(self, bg=BG_MAIN, pady=PAD_SMALL, padx=PAD); bar.pack(fill="x")
+        StyledButton(bar, "+ Add User", command=self._add).pack(side="left")
+
+        self.table = StyledTable(self, [
+            ("id",       "ID",        40),
+            ("username", "Username", 200),
+            ("role",     "Role",     100),
+            ("created",  "Created",  160),
+        ])
+        self.table.pack(fill="both", expand=True, padx=PAD, pady=PAD_SMALL)
+
+        b = tk.Frame(self, bg=BG_MAIN, pady=PAD_SMALL, padx=PAD); b.pack(fill="x")
+        StyledButton(b, "✏ Edit / Reset Password", command=self._edit,   kind="warning").pack(side="left", padx=(0,8))
+        StyledButton(b, "🗑 Delete User",           command=self._delete, kind="danger").pack(side="left")
+        tk.Label(b, text="(Admin account delete mat karna!)",
+                 font=FONT_SMALL, bg=BG_MAIN, fg=TEXT_MUTED).pack(side="left", padx=12)
+
+    def load_data(self):
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id, username, role, created_at FROM users ORDER BY id"
+        ).fetchall()
+        conn.close()
+        self.table.load([(r["id"], r["username"], r["role"],
+                          r["created_at"][:16]) for r in rows])
+
+    def _add(self):    UserDialog(self, on_save=self.load_data)
+    def _edit(self):
+        sel = self.table.get_selected()
+        if not sel: messagebox.showinfo("Edit", "Pehle ek user select karein."); return
+        conn = get_connection()
+        row = conn.execute("SELECT * FROM users WHERE id=?", (sel[0],)).fetchone()
+        conn.close()
+        if row: UserDialog(self, record=dict(row), on_save=self.load_data)
+
+    def _delete(self):
+        sel = self.table.get_selected()
+        if not sel: messagebox.showinfo("Delete", "Pehle ek user select karein."); return
+
+        # Khud apna account delete nahi kar sakta
+        if sel[0] == self._current_user.get("id"):
+            messagebox.showerror("Error ❌",
+                "Aap apna khud ka account delete nahi kar sakte!\n\n"
+                "Dusre admin se delete karwao."); return
+
+        # Last admin delete nahi ho sakta
+        conn = get_connection()
+        count = conn.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+        sel_role = conn.execute("SELECT role FROM users WHERE id=?", (sel[0],)).fetchone()
+        conn.close()
+        if count <= 1 and sel_role and sel_role["role"] == "admin":
+            messagebox.showerror("Error ❌",
+                "Sirf ek Admin bacha hai!\n\n"
+                "Pehle koi aur Admin banao,\n"
+                "phir is account ko delete karo."); return
+
+        if not messagebox.askyesno("Delete",
+                f"'{sel[1]}' user delete karein?\n\nYe user dobara login nahi kar payega.",
+                parent=self): return
+        conn = get_connection()
+        conn.execute("DELETE FROM users WHERE id=?", (sel[0],))
+        conn.commit(); conn.close()
+        self.load_data()
+        messagebox.showinfo("Done ✅", f"User '{sel[1]}' delete ho gaya!")
+
+
+class UserDialog(ModalDialog):
+    def __init__(self, parent, record=None, on_save=None):
+        title = "Add New User" if not record else "Edit User / Reset Password"
+        super().__init__(parent, title, 440, 380)
+        self.record = record; self.on_save = on_save
+        self._build()
+        if record: self._populate()
+
+    def _build(self):
+        b = self.body; b.columnconfigure(1, weight=1)
+
+        # Info label
+        info_txt = ("Naya user banao — sirf yahi log app use kar payenge!" if not self.record
+                    else "Password change karo ya role update karo.")
+        tk.Label(b, text=info_txt, font=FONT_SMALL, bg=BG_CARD,
+                 fg=TEXT_MUTED, wraplength=380).grid(row=0, column=0, columnspan=2,
+                                                      sticky="w", pady=(0,12))
+
+        fields = [("Username *", "uname"), ("Password *", "pwd"),
+                  ("Confirm Password *", "cpwd")]
+        self.vars = {}
+        for i, (lbl, key) in enumerate(fields):
+            tk.Label(b, text=lbl, font=FONT_NORMAL, bg=BG_CARD,
+                     fg=TEXT_MAIN).grid(row=i+1, column=0, sticky="w", pady=8, padx=(0,12))
+            v = tk.StringVar(); self.vars[key] = v
+            show = "•" if "pwd" in key else ""
+            tk.Entry(b, textvariable=v, show=show, font=FONT_NORMAL,
+                     bg=ENTRY_BG, fg=ENTRY_FG, relief="solid", bd=1
+                     ).grid(row=i+1, column=1, sticky="ew", ipady=4)
+
+        # Role
+        tk.Label(b, text="Role", font=FONT_NORMAL, bg=BG_CARD,
+                 fg=TEXT_MAIN).grid(row=4, column=0, sticky="w", pady=8, padx=(0,12))
+        self.role_var = tk.StringVar(value="user")
+        role_frame = tk.Frame(b, bg=BG_CARD); role_frame.grid(row=4, column=1, sticky="w")
+        tk.Radiobutton(role_frame, text="user  (sirf data entry)",
+                       variable=self.role_var, value="user",
+                       bg=BG_CARD, fg=TEXT_MAIN, font=FONT_SMALL).pack(anchor="w")
+        tk.Radiobutton(role_frame, text="admin (sab kuch + Users manage)",
+                       variable=self.role_var, value="admin",
+                       bg=BG_CARD, fg=DANGER, font=FONT_SMALL).pack(anchor="w")
+
+        # Edit note
+        if self.record:
+            tk.Label(b, text="💡 Password khali chodo agar change nahi karna",
+                     font=FONT_SMALL, bg=BG_CARD, fg=ACCENT
+                     ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4,0))
+
+        r = tk.Frame(b, bg=BG_CARD); r.grid(row=6, column=0, columnspan=2, pady=16)
+        StyledButton(r, "💾 Save", command=self._save).pack(side="left", padx=(0,8))
+        StyledButton(r, "Cancel", command=self.destroy, kind="neutral").pack(side="left")
+
+    def _populate(self):
+        self.vars["uname"].set(self.record["username"])
+        self.role_var.set(self.record["role"])
+
+    def _save(self):
+        uname = self.vars["uname"].get().strip()
+        pwd   = self.vars["pwd"].get().strip()
+        cpwd  = self.vars["cpwd"].get().strip()
+        role  = self.role_var.get()
+
+        if not uname:
+            messagebox.showerror("Error", "Username zaroori hai.", parent=self); return
+
+        # New user — password required
+        if not self.record and not pwd:
+            messagebox.showerror("Error", "Naye user ke liye password zaroori hai.", parent=self); return
+
+        # Password validation
+        if pwd:
+            if len(pwd) < 6:
+                messagebox.showerror("Error", "Password kam se kam 6 characters ka hona chahiye.", parent=self); return
+            if pwd != cpwd:
+                messagebox.showerror("Error", "Dono passwords same nahi hain!", parent=self); return
+
+        try:
+            conn = get_connection()
+            if self.record:
+                if pwd:
+                    conn.execute("UPDATE users SET username=?, role=?, password=? WHERE id=?",
+                                 (uname, role, hash_password(pwd), self.record["id"]))
+                else:
+                    conn.execute("UPDATE users SET username=?, role=? WHERE id=?",
+                                 (uname, role, self.record["id"]))
+            else:
+                # Check duplicate username
+                exists = conn.execute("SELECT id FROM users WHERE username=?", (uname,)).fetchone()
+                if exists:
+                    messagebox.showerror("Error", f"'{uname}' username already exist karta hai!", parent=self)
+                    conn.close(); return
+                conn.execute("INSERT INTO users (username, password, role) VALUES (?,?,?)",
+                             (uname, hash_password(pwd), role))
+            conn.commit(); conn.close()
+            messagebox.showinfo("Success",
+                                f"User '{uname}' {'update' if self.record else 'add'} ho gaya! ✅",
+                                parent=self)
+            if self.on_save: self.on_save()
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EMAIL BACKUP SETTINGS DIALOG
+# ═══════════════════════════════════════════════════════════════════════════════
+class EmailBackupDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("📧 Email Backup Settings")
+        self.resizable(True, True)
+        self.configure(bg=BG_CARD)
+        self.grab_set()
+        w, h = 520, 480
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(w, sw - 40)
+        h = min(h, sh - 80)
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - w // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - h // 2
+        px = max(10, min(px, sw - w - 10))
+        py = max(10, min(py, sh - h - 10))
+        self.geometry(f"{w}x{h}+{px}+{py}")
+        self._build()
+        self._load()
+
+    def _build(self):
+        tk.Frame(self, height=4, bg="#3498DB").pack(fill="x")
+        tk.Label(self, text="📧 Email Backup Settings", font=FONT_SUBTITLE,
+                 bg=BG_CARD, fg=TEXT_MAIN, padx=PAD, pady=PAD).pack(anchor="w")
+        tk.Frame(self, height=1, bg=BORDER).pack(fill="x")
+
+        body = tk.Frame(self, bg=BG_CARD, padx=PAD*2, pady=PAD)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        # How it works info
+        info = tk.Frame(body, bg="#EBF5FB", padx=10, pady=8)
+        info.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,12))
+        tk.Label(info, text="ℹ  Kaise kaam karta hai:",
+                 font=FONT_BOLD, bg="#EBF5FB", fg=INFO).pack(anchor="w")
+        tk.Label(info,
+                 text="App band karte waqt backup automatically\n"
+                      "client ki email pe chali jayegi!\n"
+                      "Gmail App Password chahiye (neeche guide hai).",
+                 font=FONT_SMALL, bg="#EBF5FB", fg=TEXT_MAIN,
+                 justify="left").pack(anchor="w")
+
+        # Fields
+        fields = [
+            ("Backup bhejni hai is email pe:", "backup_email",  False),
+            ("Sender Gmail (app ki):",          "sender_email",  False),
+            ("Gmail App Password:",             "sender_password", True),
+        ]
+        self.vars = {}
+        for i, (lbl, key, secret) in enumerate(fields):
+            tk.Label(body, text=lbl, font=FONT_SMALL, bg=BG_CARD,
+                     fg=TEXT_MUTED).grid(row=i+1, column=0, sticky="w",
+                                         pady=6, padx=(0,12))
+            v = tk.StringVar(); self.vars[key] = v
+            tk.Entry(body, textvariable=v, show="•" if secret else "",
+                     font=FONT_NORMAL, bg=ENTRY_BG, fg=ENTRY_FG,
+                     relief="solid", bd=1, width=32
+                     ).grid(row=i+1, column=1, sticky="ew", ipady=4)
+
+        # Auto backup toggle
+        self.auto_var = tk.BooleanVar()
+        tk.Checkbutton(body, text="✅ App band hone pe automatically email bhejo",
+                       variable=self.auto_var, font=FONT_NORMAL,
+                       bg=BG_CARD, fg=TEXT_MAIN
+                       ).grid(row=4, column=0, columnspan=2, sticky="w", pady=8)
+
+        # Gmail App Password guide
+        guide = tk.Frame(body, bg="#FEF9E7", padx=10, pady=8)
+        guide.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4,12))
+        tk.Label(guide, text="📖 Gmail App Password kaise banayein:",
+                 font=FONT_BOLD, bg="#FEF9E7", fg=WARNING_DARK).pack(anchor="w")
+        tk.Label(guide,
+                 text="1. myaccount.google.com pe jao\n"
+                      "2. Security → 2-Step Verification ON karo\n"
+                      "3. App Passwords → 'Mail' select karo\n"
+                      "4. Generate karo → 16-digit password aayega\n"
+                      "5. Wahi password yahan daalo",
+                 font=FONT_SMALL, bg="#FEF9E7", fg=TEXT_MAIN,
+                 justify="left").pack(anchor="w")
+
+        # Buttons
+        btn_row = tk.Frame(body, bg=BG_CARD)
+        btn_row.grid(row=6, column=0, columnspan=2, pady=12)
+        StyledButton(btn_row, "💾 Save", command=self._save).pack(side="left", padx=(0,8))
+        StyledButton(btn_row, "📧 Test Email", command=self._test, kind="info").pack(side="left", padx=(0,8))
+        StyledButton(btn_row, "Cancel", command=self.destroy, kind="neutral").pack(side="left")
+
+    def _load(self):
+        self.vars["backup_email"].set(get_setting("backup_email"))
+        self.vars["sender_email"].set(get_setting("sender_email"))
+        self.vars["sender_password"].set(get_setting("sender_password"))
+        self.auto_var.set(get_setting("auto_email_backup") == "1")
+
+    def _save(self):
+        set_setting("backup_email",      self.vars["backup_email"].get().strip())
+        set_setting("sender_email",      self.vars["sender_email"].get().strip())
+        set_setting("sender_password",   self.vars["sender_password"].get().strip())
+        set_setting("auto_email_backup", "1" if self.auto_var.get() else "0")
+        messagebox.showinfo("Saved ✅",
+                            "Settings save ho gayi!\n\n"
+                            "'Test Email' dabao yeh check karne ke liye\n"
+                            "ki email sahi ja rahi hai ya nahi.",
+                            parent=self)
+
+    def _test(self):
+        """Test email bhejo abhi."""
+        import shutil, threading
+        self._save()
+        # Create temp backup for test
+        import tempfile
+        tmp = tempfile.mktemp(suffix=".db")
+        try: shutil.copy2(DB_PATH, tmp)
+        except: tmp = DB_PATH
+
+        def do_test():
+            ok, err = send_email_backup(tmp)
+            if ok:
+                messagebox.showinfo("Test Successful! ✅",
+                                    f"Email send ho gayi!\n"
+                                    f"Check karein: {get_setting('backup_email')}",
+                                    parent=self)
+            else:
+                messagebox.showerror("Test Failed ❌", err, parent=self)
+
+        threading.Thread(target=do_test, daemon=True).start()
+        messagebox.showinfo("Sending...", "Email bhej raha hoon...\nThodi der mein pata chalega!", parent=self)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN APPLICATION WINDOW
 # ═══════════════════════════════════════════════════════════════════════════════
 class MainApp(tk.Tk):
     def __init__(self, user):
         super().__init__()
         self.user = user
-        self.title("Oil Refinery Management System")
+        self.title("Saark Industries - ERP")
         try: self.state("zoomed")
         except: self.geometry("1280x800")
         try: self.attributes("-zoomed", True)
@@ -1800,7 +2794,7 @@ class MainApp(tk.Tk):
         self.configure(bg=BG_MAIN)
         # Top bar
         top = tk.Frame(self, bg=BG_TOPBAR, height=TOPBAR_H); top.pack(fill="x"); top.pack_propagate(False)
-        tk.Label(top, text="⚙  Oil Refinery Management System", font=FONT_SUBTITLE,
+        tk.Label(top, text="⚙  Saark Industries - ERP", font=FONT_SUBTITLE,
                  bg=BG_TOPBAR, fg=TEXT_MAIN, padx=PAD).pack(side="left", pady=8)
         tk.Label(top, text=f"👤 {self.user['username']}", font=FONT_NORMAL,
                  bg=BG_TOPBAR, fg=TEXT_MUTED).pack(side="right", padx=PAD)
@@ -1812,6 +2806,27 @@ class MainApp(tk.Tk):
             b.pack(side="right")
             b.bind("<Enter>", lambda e, btn=b: btn.config(fg=TEXT_MAIN))
             b.bind("<Leave>", lambda e, btn=b: btn.config(fg=TEXT_MUTED))
+        # Backup / Restore buttons
+        tk.Frame(top, width=1, bg=BORDER).pack(side="right", fill="y", pady=6)
+        restore_btn = tk.Button(top, text="📂 Restore", command=self._restore_backup,
+                                font=FONT_SMALL, bg="#E74C3C", fg="white",
+                                relief="flat", bd=0, cursor="hand2", pady=4, padx=10)
+        restore_btn.pack(side="right", padx=2)
+        backup_btn = tk.Button(top, text="💾 Backup", command=self._take_backup,
+                               font=FONT_SMALL, bg="#27AE60", fg="white",
+                               relief="flat", bd=0, cursor="hand2", pady=4, padx=10)
+        backup_btn.pack(side="right", padx=2)
+        # Admin only buttons
+        if self.user.get("role") == "admin":
+            tk.Frame(top, width=1, bg=BORDER).pack(side="right", fill="y", pady=6)
+            email_btn = tk.Button(top, text="📧 Email Backup", command=lambda: EmailBackupDialog(self),
+                                  font=FONT_SMALL, bg="#3498DB", fg="white",
+                                  relief="flat", bd=0, cursor="hand2", pady=4, padx=10)
+            email_btn.pack(side="right", padx=2)
+            users_btn = tk.Button(top, text="👥 Users", command=lambda: self._show("Users"),
+                                  font=FONT_SMALL, bg="#F39C12", fg="white",
+                                  relief="flat", bd=0, cursor="hand2", pady=4, padx=10)
+            users_btn.pack(side="right", padx=2)
         # Dark/Light mode toggle
         self._theme_btn_text = tk.StringVar(value="🌙 Dark Mode" if _current_theme=="light" else "☀ Light Mode")
         theme_btn = tk.Button(top, textvariable=self._theme_btn_text, command=self._toggle_theme,
@@ -1863,6 +2878,7 @@ class MainApp(tk.Tk):
                 "ProfitLoss":        ProfitLossFrame,
                 "ProductionLedger":  ProductionLedgerFrame,
                 "Expenses":          ExpenseFrame,
+                "Users":             lambda p: UsersFrame(p, self.user),
             }
             cls = frame_map.get(key)
             if cls: self._frames[key] = cls(self.content)
@@ -1882,27 +2898,135 @@ class MainApp(tk.Tk):
         if key == "Dashboard": self._frames[key].refresh()
 
     def _change_pw(self): ChangePasswordDialog(self, self.user)
+
+    def _take_backup(self):
+        """Manual backup — user chooses where to save."""
+        import shutil
+        from tkinter.filedialog import asksaveasfilename
+        date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        default  = f"saark_backup_{date_str}.db"
+        path = asksaveasfilename(
+            defaultextension=".db",
+            initialfile=default,
+            filetypes=[("Database Backup","*.db"),("All Files","*.*")],
+            title="Backup kahan save karein?"
+        )
+        if not path: return
+        try:
+            shutil.copy2(DB_PATH, path)
+            messagebox.showinfo("Backup Successful! ✅",
+                f"Backup save ho gaya:\n{path}\n\n"
+                f"Ye file safe jagah rakhein — Pen Drive ya Google Drive mein!")
+        except Exception as e:
+            messagebox.showerror("Backup Failed", str(e))
+
+    def _restore_backup(self):
+        """Restore from backup file."""
+        import shutil
+        from tkinter.filedialog import askopenfilename
+        if not messagebox.askyesno("Restore Backup ⚠",
+            "Restore karne se ABHI KA SARA DATA HAT JAYEGA!\n"
+            "Aur backup wala data aa jayega.\n\n"
+            "Kya aap sure hain?", parent=self):
+            return
+        path = askopenfilename(
+            filetypes=[("Database Backup","*.db"),("All Files","*.*")],
+            title="Backup file select karein"
+        )
+        if not path: return
+        try:
+            # Auto backup current data before restore
+            import shutil as sh
+            date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            auto_bkp = DB_PATH.replace(".db", f"_before_restore_{date_str}.db")
+            sh.copy2(DB_PATH, auto_bkp)
+            # Restore
+            sh.copy2(path, DB_PATH)
+            messagebox.showinfo("Restore Successful! ✅",
+                f"Data restore ho gaya!\n\n"
+                f"Purana data save hai:\n{auto_bkp}\n\n"
+                f"App restart ho rahi hai...")
+            # Restart app
+            user = self.user
+            self.destroy()
+            apply_theme(_current_theme)
+            initialize_database()
+            app = MainApp(user)
+            app.mainloop()
+        except Exception as e:
+            messagebox.showerror("Restore Failed", str(e))
+
+    def _auto_backup(self):
+        """Auto backup on app close — last 7 days rakho + email bhejo."""
+        import shutil, glob, threading
+        try:
+            bkp_folder = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "backups")
+            os.makedirs(bkp_folder, exist_ok=True)
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            bkp_path = os.path.join(bkp_folder, f"saark_auto_{date_str}.db")
+            shutil.copy2(DB_PATH, bkp_path)
+            # Purane backups delete karo (7 din se purane)
+            all_bkps = sorted(glob.glob(os.path.join(bkp_folder, "saark_auto_*.db")))
+            if len(all_bkps) > 7:
+                for old in all_bkps[:-7]:
+                    try: os.remove(old)
+                    except: pass
+            # Email backup agar enabled hai
+            if get_setting("auto_email_backup") == "1":
+                def send_bg():
+                    ok, err = send_email_backup(bkp_path)
+                    if not ok:
+                        print(f"[Email Backup] Failed: {err}")
+                threading.Thread(target=send_bg, daemon=True).start()
+        except Exception:
+            pass
+
     def _toggle_theme(self):
         new_theme = "dark" if _current_theme == "light" else "light"
         apply_theme(new_theme)
-        # Restart app to apply theme fully
         user = self.user
         self.destroy()
         app = MainApp(user)
         app.mainloop()
+
     def _logout(self):
         if messagebox.askyesno("Logout","Logout?",parent=self):
+            self._auto_backup()
             self.destroy(); run_app()
+
     def _on_close(self):
-        if messagebox.askyesno("Exit","Exit application?",parent=self): self.destroy()
+        if messagebox.askyesno("Exit","Exit application?",parent=self):
+            self._auto_backup()
+            self.destroy()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_app():
+    # ── Hardware Lock Check ───────────────────────────────────────────────────
+    if not check_hardware_lock():
+        show_lock_error()
+        return
+    # ─────────────────────────────────────────────────────────────────────────
     apply_theme(_current_theme)
     initialize_database()
+
+    # ── First Time Setup Check ────────────────────────────────────────────────
+    conn = get_connection()
+    user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+
+    if user_count == 0:
+        # Pehli baar — setup screen dikhao
+        sw = FirstSetupWindow()
+        sw.mainloop()
+        if not sw.setup_done:
+            # User ne setup cancel kiya — band karo
+            return
+
+    # ── Normal Login ──────────────────────────────────────────────────────────
     lw = LoginWindow()
     lw.mainloop()
     if lw.logged_in_user:
