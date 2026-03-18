@@ -1,5 +1,5 @@
 """
-Saark Industries - ERP
+oil_refinery - ERP
 Single-file version — Python + Tkinter + SQLite
 Run: python oil_refinery.py
 Default Login: admin / admin123
